@@ -1,0 +1,28 @@
+# Node dependencies
+node_modules/
+dist/
+.env
+.env.local
+
+# Python virtual environment
+.venv/
+venv/
+ENV/
+__pycache__/
+*.pyc
+
+# Large model files (exceeds GitHub size limits)
+*.ckpt
+*.keras
+
+# IDE and system files
+.idea/
+.vscode/
+.gemini/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+Thumbs.db
+.DS_Store
