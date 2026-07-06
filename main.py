@@ -11,6 +11,7 @@ Endpoints:
 import os, io, base64, warnings, tempfile
 from pathlib import Path
 import numpy as np
+import cv2
 import torch
 import torch.nn as nn
 import timm
@@ -39,7 +40,7 @@ warnings.filterwarnings("ignore")
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
 MAMMO_CKPT_PATH = os.getenv("MAMMO_CKPT_PATH", str(BASE_DIR / "phase2-epoch=09-val_auc=0.9036.ckpt"))
-SONO_MODEL_PATH  = os.getenv("SONO_MODEL_PATH",  str(BASE_DIR / "BUSI_best_model.keras"))
+SONO_MODEL_PATH  = os.getenv("SONO_MODEL_PATH",  str(BASE_DIR / "Frozen92.16.keras"))
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 MAMMO_CLASSES  = ["Normal", "Benign", "Suspicious Malignant", "Malignant"]
@@ -143,7 +144,11 @@ async def lifespan(app: FastAPI):
     # ── Sonography ────────────────────────────────────────────
     if not os.path.exists(SONO_MODEL_PATH):
         raise RuntimeError(f"Sono model not found: {SONO_MODEL_PATH}")
-    sono_model = tf.keras.models.load_model(SONO_MODEL_PATH, compile=False)
+    sono_model = tf.keras.models.load_model(
+        SONO_MODEL_PATH, 
+        compile=False,
+        custom_objects={'Custom>mish': tf.keras.activations.mish, 'mish': tf.keras.activations.mish}
+    )
     SONO_IMG_SIZE = sono_model.input_shape[1]
 
     sono_last_conv_layer = None
@@ -187,6 +192,36 @@ app.add_middleware(
 # ══════════════════════════════════════════════════════════════════════════════
 # PREPROCESSING
 # ══════════════════════════════════════════════════════════════════════════════
+
+def apply_clahe(image_uint8, clip_limit=1.5, tile_grid_size=(8, 8)):
+    """
+    Apply CLAHE to a single RGB image.
+    """
+    lab = cv2.cvtColor(image_uint8, cv2.COLOR_RGB2LAB)
+    l_channel, a_channel, b_channel = cv2.split(lab)
+
+    clahe = cv2.createCLAHE(
+        clipLimit=clip_limit,
+        tileGridSize=tile_grid_size
+    )
+    l_enhanced = clahe.apply(l_channel)
+
+    lab_enhanced = cv2.merge(
+        [l_enhanced, a_channel, b_channel]
+    )
+    result = cv2.cvtColor(
+        lab_enhanced,
+        cv2.COLOR_LAB2RGB
+    )
+
+    return result
+
+def tta_predict(model, images):
+    preds = []
+    preds.append(model.predict(images, verbose=0))
+    preds.append(model.predict(tf.image.flip_left_right(images), verbose=0))
+    preds.append(model.predict(tf.image.flip_up_down(images), verbose=0))
+    return np.mean(preds, axis=0)
 
 def preprocess_mammogram_image(source, target_size: int = MAMMO_IMG_SIZE) -> np.ndarray:
     """JPG/JPEG → (512,512,3) uint8"""
@@ -259,7 +294,11 @@ def preprocess_sono_image(source) -> np.ndarray:
 
     # Grayscale → 3-channel uint8
     gray = np.array(img, dtype=np.uint8)          # (H, W)
-    arr  = np.stack([gray] * 3, axis=-1).astype(np.float32)  # (H, W, 3)
+    arr_uint8 = np.stack([gray] * 3, axis=-1)     # (H, W, 3)
+    
+    # Apply CLAHE
+    arr_clahe = apply_clahe(arr_uint8)
+    arr = arr_clahe.astype(np.float32)
 
     # ImageNet normalisation
     mean = np.array(IMAGENET_MEAN) * 255.0
@@ -296,20 +335,25 @@ def mammo_gradcam_pp(image_tensor):
 
 
 def sono_gradcam_pp(img_array):
+    img_batch = tf.cast(np.expand_dims(img_array, 0), tf.float32)
+    
+    tta_preds = tta_predict(sono_model, img_batch)
+    if tta_preds.shape[-1] == 1:
+        probs = np.array([1 - float(tta_preds[0][0]), float(tta_preds[0][0])])
+    else:
+        probs = tf.nn.softmax(tta_preds[0]).numpy()
+        
+    pred_class  = int(np.argmax(probs))
+    confidence  = float(probs[pred_class])
+
     grad_model = tf.keras.models.Model(
         inputs  = sono_model.inputs,
         outputs = [sono_model.get_layer(sono_last_conv_layer).output, sono_model.output],
     )
-    img_batch = tf.cast(np.expand_dims(img_array, 0), tf.float32)
+    
     with tf.GradientTape() as tape:
         tape.watch(img_batch)
         conv_outputs, predictions = grad_model(img_batch)
-        if predictions.shape[-1] == 1:
-            probs = np.array([1 - float(predictions[0][0]), float(predictions[0][0])])
-        else:
-            probs = tf.nn.softmax(predictions[0]).numpy()
-        pred_class  = int(np.argmax(probs))
-        confidence  = float(probs[pred_class])
         class_score = predictions[:, pred_class]
     grads   = tape.gradient(class_score, conv_outputs)
     weights = tf.reduce_mean(grads[0], axis=(0, 1))
@@ -465,11 +509,11 @@ async def predict_sono_bulk(files: List[UploadFile] = File(...)):
         try:
             img_array   = preprocess_sono_image(raw)
             img_batch   = tf.cast(np.expand_dims(img_array, 0), tf.float32)
-            predictions = sono_model(img_batch)
-            if predictions.shape[-1] == 1:
-                probs = np.array([1 - float(predictions[0][0]), float(predictions[0][0])])
+            tta_preds   = tta_predict(sono_model, img_batch)
+            if tta_preds.shape[-1] == 1:
+                probs = np.array([1 - float(tta_preds[0][0]), float(tta_preds[0][0])])
             else:
-                probs = tf.nn.softmax(predictions[0]).numpy()
+                probs = tf.nn.softmax(tta_preds[0]).numpy()
             pred_cls = int(np.argmax(probs))
             conf     = float(probs[pred_cls])
             flag, reasons = sono_flag_logic(probs, pred_cls)
