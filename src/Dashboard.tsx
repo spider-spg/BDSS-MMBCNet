@@ -8,6 +8,19 @@ const apiBase = (import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000').r
 
 type Modality = 'mammo' | 'sono';
 
+type DicomMetadata = {
+  patient_name: string;
+  patient_id: string;
+  patient_dob: string;
+  patient_sex: string;
+  study_date: string;
+  study_description: string;
+  modality: string;
+  accession_number: string;
+  institution: string;
+  referring_physician: string;
+};
+
 type PredictionResult = {
   modality: string;
   filename: string;
@@ -17,6 +30,7 @@ type PredictionResult = {
   flagged: boolean;
   flag_reasons: string[];
   gradcam_image_b64: string;
+  dicom_metadata: DicomMetadata | null;
 };
 
 function IconButton({ children, ariaLabel, onClick }: { children: ReactNode; ariaLabel: string; onClick?: () => void }) {
@@ -54,6 +68,7 @@ function Dashboard({ onSignOut }: { onSignOut: () => void }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [health, setHealth] = useState<'unknown' | 'ok' | 'down'>('unknown');
+  const [isDicom, setIsDicom] = useState(false);
 
   const inputRef = useRef<HTMLInputElement | null>(null);
 
@@ -105,9 +120,17 @@ function Dashboard({ onSignOut }: { onSignOut: () => void }) {
     setFile(nextFile);
     setResult(null);
     setError('');
+    setIsDicom(false);
 
     if (nextFile) {
-      setPreviewUrl(URL.createObjectURL(nextFile));
+      // For DICOM files, we can't render a native preview — show a placeholder
+      const dcm = nextFile.name.toLowerCase().endsWith('.dcm');
+      setIsDicom(dcm);
+      if (!dcm) {
+        setPreviewUrl(URL.createObjectURL(nextFile));
+      } else {
+        setPreviewUrl(''); // Preview generated after analysis
+      }
       setPreviewExpanded(false);
     } else {
       setPreviewUrl('');
@@ -164,6 +187,20 @@ function Dashboard({ onSignOut }: { onSignOut: () => void }) {
     setResult(null);
     setError('');
     setBusy(false);
+    setIsDicom(false);
+  };
+
+  // Format DICOM date string YYYYMMDD → DD/MM/YYYY
+  const fmtDate = (d: string) => {
+    if (!d || d.length < 8) return d;
+    return `${d.slice(6, 8)}/${d.slice(4, 6)}/${d.slice(0, 4)}`;
+  };
+
+  const handlePrint = () => window.print();
+
+  const handleExportPdf = () => {
+    // Trigger browser print dialog — user can "Save as PDF"
+    window.print();
   };
 
   const gradcamDataUrl = result ? `data:image/png;base64,${result.gradcam_image_b64}` : '';
@@ -293,7 +330,7 @@ function Dashboard({ onSignOut }: { onSignOut: () => void }) {
                 </button>
               </h2>
 
-              <input ref={inputRef} type="file" accept="image/*" className="hidden" onChange={onFileChange} />
+              <input ref={inputRef} type="file" accept="image/*,.dcm" className="hidden" onChange={onFileChange} />
 
               <div
                 role="button"
@@ -309,8 +346,14 @@ function Dashboard({ onSignOut }: { onSignOut: () => void }) {
                 onDrop={onDrop}
                 className="group flex aspect-square w-full cursor-pointer items-center justify-center overflow-hidden rounded border-2 border-dashed border-[#c4c5d7] bg-[#f3f2fe] transition hover:border-[#1d4ed8] hover:bg-[#ededf9]"
               >
-                {previewUrl ? (
+                {previewUrl && !isDicom ? (
                   <img src={previewUrl} alt="Selected upload preview" className="h-full w-full object-contain" />
+                ) : isDicom ? (
+                  <div className="flex flex-col items-center gap-2 px-4 text-center">
+                    <span className="material-symbols-outlined text-[36px] text-[#0037b0]">description</span>
+                    <div className="text-[13px] font-semibold text-[#1a1b23]">{file?.name}</div>
+                    <div className="text-[11px] text-[#575e70]">DICOM file ready · Run analysis to preview</div>
+                  </div>
                 ) : (
                   <div className="flex flex-col items-center gap-3 px-4 text-center text-[#575e70] transition group-hover:text-[#1a1b23]">
                     <div className="flex h-12 w-12 items-center justify-center rounded-full border border-[#c4c5d7] bg-white shadow-sm">
@@ -318,7 +361,8 @@ function Dashboard({ onSignOut }: { onSignOut: () => void }) {
                     </div>
                     <div>
                       <div className="text-[14px] font-semibold text-[#1a1b23]">Upload Image</div>
-                      <div className="mt-1 text-[12px] text-[#747686]">Drag and drop or click to browse</div>
+                      <div className="mt-1 text-[12px] text-[#747686]">JPG · PNG · DICOM (.dcm)</div>
+                      <div className="mt-0.5 text-[11px] text-[#a0a3ae]">Drag and drop or click to browse</div>
                     </div>
                   </div>
                 )}
@@ -353,16 +397,60 @@ function Dashboard({ onSignOut }: { onSignOut: () => void }) {
               <h1 className="text-[18px] font-semibold leading-7 text-[#1a1b23]">Analysis Results</h1>
             </div>
             <div className="flex gap-2">
-              <button type="button" className="flex items-center gap-1 rounded border border-[#c4c5d7] bg-white px-3 py-1.5 text-[14px] font-semibold text-[#575e70] shadow-sm hover:bg-[#f3f2fe]">
+              <button
+                type="button"
+                onClick={handleExportPdf}
+                disabled={!result}
+                className="flex items-center gap-1 rounded border border-[#c4c5d7] bg-white px-3 py-1.5 text-[14px] font-semibold text-[#575e70] shadow-sm hover:bg-[#f3f2fe] disabled:opacity-40 disabled:cursor-not-allowed print:hidden"
+              >
                 <span className="material-symbols-outlined text-[16px]">download</span>
                 Export PDF
               </button>
-              <button type="button" className="flex items-center gap-1 rounded border border-[#c4c5d7] bg-white px-3 py-1.5 text-[14px] font-semibold text-[#575e70] shadow-sm hover:bg-[#f3f2fe]">
+              <button
+                type="button"
+                onClick={handlePrint}
+                disabled={!result}
+                className="flex items-center gap-1 rounded border border-[#c4c5d7] bg-white px-3 py-1.5 text-[14px] font-semibold text-[#575e70] shadow-sm hover:bg-[#f3f2fe] disabled:opacity-40 disabled:cursor-not-allowed print:hidden"
+              >
                 <span className="material-symbols-outlined text-[16px]">print</span>
                 Print
               </button>
             </div>
           </div>
+
+          {/* Patient Info Panel — shown when DICOM metadata is available */}
+          {result?.dicom_metadata && (() => {
+            const m = result.dicom_metadata;
+            const rows = [
+              { label: 'Patient Name',       value: m.patient_name },
+              { label: 'Patient ID',         value: m.patient_id },
+              { label: 'Date of Birth',      value: fmtDate(m.patient_dob) },
+              { label: 'Sex',                value: m.patient_sex },
+              { label: 'Study Date',         value: fmtDate(m.study_date) },
+              { label: 'Study Description',  value: m.study_description },
+              { label: 'Modality',           value: m.modality },
+              { label: 'Accession No.',      value: m.accession_number },
+              { label: 'Institution',        value: m.institution },
+              { label: 'Referring Physician',value: m.referring_physician },
+            ].filter(r => r.value);
+            return (
+              <div className="mt-4 rounded border border-[#c4c5d7] bg-white shadow-sm print:mt-0">
+                <div className="flex items-center gap-2 border-b border-[#c4c5d7] bg-[#f2f0fb] px-4 py-2">
+                  <span className="material-symbols-outlined text-[18px] text-[#434655]">badge</span>
+                  <h3 className="text-[14px] font-semibold text-[#2c2f3a]">Patient Information</h3>
+                  <span className="ml-1 rounded bg-[#dce3f9] px-2 py-0.5 text-[11px] font-semibold text-[#0037b0]">DICOM</span>
+                </div>
+                <div className="grid grid-cols-2 gap-x-6 gap-y-2 px-4 py-3 sm:grid-cols-3">
+                  {rows.map(r => (
+                    <div key={r.label}>
+                      <div className="text-[11px] font-semibold uppercase tracking-[0.1em] text-[#747686]">{r.label}</div>
+                      <div className="mt-0.5 text-[13px] font-medium text-[#1a1b23] break-words">{r.value}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })()}
 
           {error ? (
             <div className="mt-4 rounded border border-[#f1b4ad] bg-[#fff2f0] px-4 py-3 text-[14px] font-medium text-[#ba1a1a]">{error}</div>
@@ -494,6 +582,20 @@ function Dashboard({ onSignOut }: { onSignOut: () => void }) {
                     <div className="h-2 w-[260px] rounded" style={{ background: 'linear-gradient(to right, #000080, #0000ff, #00ffff, #ffff00, #ff0000)' }} />
                     <span className="text-[12px] font-semibold uppercase tracking-[0.14em] text-[#575e70]">High Activation</span>
                   </div>
+
+                  {/* Grad-CAM Interpretation Guide */}
+                  <div className="mt-3 rounded border border-[#c4c5d7] bg-[#f9fafb] px-4 py-3">
+                    <div className="flex items-start gap-2">
+                      <span className="material-symbols-outlined mt-[1px] shrink-0 text-[16px] text-[#0037b0]">info</span>
+                      <div>
+                        <p className="text-[12px] font-semibold text-[#1a1b23]">How to read this heatmap</p>
+                        <p className="mt-1 text-[12px] leading-relaxed text-[#575e70]">
+                          The AI highlights the regions it focused on to make its prediction. <span className="font-semibold text-[#ba1a1a]">Red / yellow areas</span> are the most influential — they contributed most to the diagnosis. <span className="font-semibold text-[#0037b0]">Blue / dark areas</span> were less relevant. Use these hotspots to verify the AI's attention aligns with the suspicious tissue region on the original scan.
+                        </p>
+                        <p className="mt-1 text-[11px] text-[#747686] italic">This is an assistive tool — always apply clinical judgement.</p>
+                      </div>
+                    </div>
+                  </div>
                 </div>
               </section>
             </div>
@@ -547,6 +649,20 @@ function Dashboard({ onSignOut }: { onSignOut: () => void }) {
                     <span className="text-[12px] font-semibold uppercase tracking-[0.14em] text-[#575e70]">Low</span>
                     <div className="h-2 w-[260px] rounded" style={{ background: 'linear-gradient(to right, #000080, #0000ff, #00ffff, #ffff00, #ff0000)' }} />
                     <span className="text-[12px] font-semibold uppercase tracking-[0.14em] text-[#575e70]">High Activation</span>
+                  </div>
+
+                  {/* Grad-CAM Interpretation Guide (expanded modal) */}
+                  <div className="mt-3 rounded border border-[#c4c5d7] bg-[#f9fafb] px-4 py-3">
+                    <div className="flex items-start gap-2">
+                      <span className="material-symbols-outlined mt-[1px] shrink-0 text-[16px] text-[#0037b0]">info</span>
+                      <div>
+                        <p className="text-[12px] font-semibold text-[#1a1b23]">How to read this heatmap</p>
+                        <p className="mt-1 text-[12px] leading-relaxed text-[#575e70]">
+                          The AI highlights the regions it focused on to make its prediction. <span className="font-semibold text-[#ba1a1a]">Red / yellow areas</span> are the most influential — they contributed most to the diagnosis. <span className="font-semibold text-[#0037b0]">Blue / dark areas</span> were less relevant. Use these hotspots to verify the AI's attention aligns with the suspicious tissue region on the original scan.
+                        </p>
+                        <p className="mt-1 text-[11px] text-[#747686] italic">This is an assistive tool — always apply clinical judgement.</p>
+                      </div>
+                    </div>
                   </div>
                 </div>
               </div>

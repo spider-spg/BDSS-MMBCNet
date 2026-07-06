@@ -34,8 +34,104 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from typing import List
+try:
+    import pydicom
+    from pydicom.pixel_data_handlers.util import apply_voi_lut
+    PYDICOM_AVAILABLE = True
+except ImportError:
+    PYDICOM_AVAILABLE = False
 
 warnings.filterwarnings("ignore")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DICOM PARSER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _str(tag):
+    """Safely convert a DICOM tag value to a stripped string."""
+    try:
+        return str(tag).strip()
+    except Exception:
+        return ""
+
+def parse_dicom(raw: bytes):
+    """
+    Parse a DICOM byte stream.
+    Returns:
+      image_bytes : JPEG bytes suitable for model inference
+      metadata    : dict of patient / study fields
+    """
+    if not PYDICOM_AVAILABLE:
+        raise RuntimeError("pydicom is not installed.")
+    return _dicom_to_jpeg(raw)
+
+
+def _is_dicom(raw: bytes, filename: str) -> bool:
+    """Heuristic: check DICOM magic bytes or .dcm extension."""
+    is_dcm_ext = filename.lower().endswith(".dcm")
+    is_dcm_magic = len(raw) > 132 and raw[128:132] == b"DICM"
+    return is_dcm_ext or is_dcm_magic
+
+
+def try_parse_as_dicom(raw: bytes):
+    """
+    Attempt to parse raw bytes as DICOM (even without the DICM preamble).
+    Returns (image_bytes, metadata) on success, or raises InvalidDicomError.
+    Used as fallback for files that aren't recognized standard images.
+    """
+    if not PYDICOM_AVAILABLE:
+        raise RuntimeError("pydicom is not installed.")
+    # force=True allows parsing old ACR-NEMA DICOMs without the 128-byte preamble
+    ds = pydicom.dcmread(io.BytesIO(raw), force=True)
+    # Confirm it actually has pixel data — otherwise it's not a valid image DICOM
+    if not hasattr(ds, 'PixelData'):
+        raise ValueError("No pixel data in DICOM file.")
+    return parse_dicom.__wrapped__(raw, ds) if hasattr(parse_dicom, '__wrapped__') else _dicom_to_jpeg(raw)
+
+
+def _dicom_to_jpeg(raw: bytes, ds=None):
+    """Convert DICOM pixel data to JPEG + extract metadata. Accepts pre-parsed ds."""
+    if ds is None:
+        ds = pydicom.dcmread(io.BytesIO(raw), force=True)
+
+    def tag(name, default=""):
+        val = getattr(ds, name, None)
+        return _str(val) if val is not None else default
+
+    metadata = {
+        "patient_name"       : tag("PatientName"),
+        "patient_id"         : tag("PatientID"),
+        "patient_dob"        : tag("PatientBirthDate"),
+        "patient_sex"        : tag("PatientSex"),
+        "study_date"         : tag("StudyDate"),
+        "study_description"  : tag("StudyDescription"),
+        "modality"           : tag("Modality"),
+        "accession_number"   : tag("AccessionNumber"),
+        "institution"        : tag("InstitutionName"),
+        "referring_physician": tag("ReferringPhysicianName"),
+    }
+
+    pixel_array = ds.pixel_array
+    try:
+        pixel_array = apply_voi_lut(pixel_array, ds)
+    except Exception:
+        pass
+
+    pmin, pmax = float(pixel_array.min()), float(pixel_array.max())
+    if pmax > pmin:
+        pixel_array = ((pixel_array - pmin) / (pmax - pmin) * 255).astype(np.uint8)
+    else:
+        pixel_array = np.zeros_like(pixel_array, dtype=np.uint8)
+
+    if pixel_array.ndim == 2:
+        pixel_array = np.stack([pixel_array] * 3, axis=-1)
+    elif pixel_array.shape[-1] == 1:
+        pixel_array = np.concatenate([pixel_array] * 3, axis=-1)
+
+    buf = io.BytesIO()
+    Image.fromarray(pixel_array).save(buf, format="JPEG", quality=95)
+    return buf.getvalue(), metadata
+
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
@@ -44,7 +140,7 @@ SONO_MODEL_PATH  = os.getenv("SONO_MODEL_PATH",  str(BASE_DIR / "Frozen92.16.ker
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 MAMMO_CLASSES  = ["Normal", "Benign", "Suspicious Malignant", "Malignant"]
-SONO_CLASSES   = ["Normal", "Benign", "Malignant"]
+SONO_CLASSES   = ["Benign", "Malignant", "Normal"]
 MAMMO_IMG_SIZE = 512
 DEVICE         = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -68,7 +164,7 @@ mammo_target_layers = None
 mammo_transform     = None
 sono_model          = None
 sono_last_conv_layer= None
-SONO_IMG_SIZE       = 224
+SONO_IMG_SIZE       = 300
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -144,23 +240,39 @@ async def lifespan(app: FastAPI):
     # ── Sonography ────────────────────────────────────────────
     if not os.path.exists(SONO_MODEL_PATH):
         raise RuntimeError(f"Sono model not found: {SONO_MODEL_PATH}")
+    
     sono_model = tf.keras.models.load_model(
-        SONO_MODEL_PATH, 
+        SONO_MODEL_PATH,
         compile=False,
         custom_objects={'Custom>mish': tf.keras.activations.mish, 'mish': tf.keras.activations.mish}
     )
-    SONO_IMG_SIZE = sono_model.input_shape[1]
+    sono_model.trainable = True
+    if sono_model.input_shape[1] is not None:
+        SONO_IMG_SIZE = sono_model.input_shape[1]
 
     sono_last_conv_layer = None
-    for layer in reversed(sono_model.layers):
-        if isinstance(layer, (
-            tf.keras.layers.Conv2D,
-            tf.keras.layers.DepthwiseConv2D,
-            tf.keras.layers.SeparableConv2D,
-        )):
+    
+    # Try to find the primary fusion layer first for stable gradients
+    for layer in sono_model.layers:
+        if layer.name == 'feature_fusion':
             sono_last_conv_layer = layer.name
             break
-    assert sono_last_conv_layer, "No conv layer found in sono model."
+            
+    # Fallback to the last spatial layer
+    if not sono_last_conv_layer:
+        for layer in reversed(sono_model.layers):
+            try:
+                out_shape = layer.output.shape
+                if isinstance(out_shape, list):
+                    out_shape = out_shape[0].shape
+                
+                if len(out_shape) == 4 and out_shape[1] is not None and out_shape[1] > 1:
+                    sono_last_conv_layer = layer.name
+                    break
+            except Exception:
+                continue
+                
+    assert sono_last_conv_layer, "No spatial feature layer found in sono model."
     print(f"[startup] Sono model loaded  | input={SONO_IMG_SIZE}px | gradcam={sono_last_conv_layer}")
 
     yield
@@ -217,6 +329,9 @@ def apply_clahe(image_uint8, clip_limit=1.5, tile_grid_size=(8, 8)):
     return result
 
 def tta_predict(model, images):
+    """
+    Test Time Augmentation (TTA) - Exact match to user colab
+    """
     preds = []
     preds.append(model.predict(images, verbose=0))
     preds.append(model.predict(tf.image.flip_left_right(images), verbose=0))
@@ -272,38 +387,19 @@ def preprocess_mammogram_image(source, target_size: int = MAMMO_IMG_SIZE) -> np.
     return np.stack([padded] * 3, axis=-1)   # (512,512,3) uint8
 
 
-def preprocess_sono_image(source) -> np.ndarray:
+def preprocess_sono_image(raw: bytes):
     """
-    Any image format (JPG/PNG/etc.) → (H,W,3) float32, ImageNet-normalised.
-
-    Pipeline:
-      1. Load → convert to grayscale (L)
-      2. Resize to SONO_IMG_SIZE × SONO_IMG_SIZE (bicubic)
-      3. Stack grayscale × 3 to get (H,W,3) uint8
-      4. ImageNet normalisation → float32
+    Exact preprocessing from user's Colab training notebook
     """
-    if isinstance(source, bytes):
-        img = Image.open(io.BytesIO(source)).convert("L")
-    elif isinstance(source, Image.Image):
-        img = source.convert("L")
-    else:
-        raise TypeError(f"Expected bytes or PIL Image, got {type(source)}")
-
-    # Resize
-    img = img.resize((SONO_IMG_SIZE, SONO_IMG_SIZE), Image.BICUBIC)
-
-    # Grayscale → 3-channel uint8
-    gray = np.array(img, dtype=np.uint8)          # (H, W)
-    arr_uint8 = np.stack([gray] * 3, axis=-1)     # (H, W, 3)
+    img = Image.open(io.BytesIO(raw)).convert('RGB')
     
-    # Apply CLAHE
-    arr_clahe = apply_clahe(arr_uint8)
-    arr = arr_clahe.astype(np.float32)
+    img = img.resize((SONO_IMG_SIZE, SONO_IMG_SIZE))
+    img = np.array(img).astype(np.float32)
 
-    # ImageNet normalisation
-    mean = np.array(IMAGENET_MEAN) * 255.0
-    std  = np.array(IMAGENET_STD)  * 255.0
-    return (arr - mean) / std   # (H, W, 3) float32
+    # Apply CLAHE if used during training
+    img = apply_clahe(img.astype(np.uint8)).astype(np.float32)
+
+    return img   # (H, W, 3) float32 in [0, 255]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -339,36 +435,53 @@ def sono_gradcam_pp(img_array):
     
     tta_preds = tta_predict(sono_model, img_batch)
     if tta_preds.shape[-1] == 1:
-        probs = np.array([1 - float(tta_preds[0][0]), float(tta_preds[0][0])])
+        probs = np.array([1 - float(tta_preds[0]), float(tta_preds[0])])
     else:
-        probs = tf.nn.softmax(tta_preds[0]).numpy()
+        probs = tta_preds[0]
         
     pred_class  = int(np.argmax(probs))
     confidence  = float(probs[pred_class])
 
     grad_model = tf.keras.models.Model(
         inputs  = sono_model.inputs,
-        outputs = [sono_model.get_layer(sono_last_conv_layer).output, sono_model.output],
+        outputs = [sono_model.get_layer('multiply_1').output, sono_model.output],
     )
     
+    # Watch the input tensor; the tape records ALL ops from img_batch → conv_outputs → preds
+    # This lets us call tape.gradient(score, conv_outputs) even though conv_outputs wasn't
+    # explicitly watched — the tape traces back through the recorded graph.
     with tf.GradientTape() as tape:
         tape.watch(img_batch)
         conv_outputs, predictions = grad_model(img_batch)
-        class_score = predictions[:, pred_class]
-    grads   = tape.gradient(class_score, conv_outputs)
-    weights = tf.reduce_mean(grads[0], axis=(0, 1))
-    cam_raw = tf.reduce_sum(conv_outputs[0] * weights, axis=-1).numpy()
-    cam_raw = np.maximum(cam_raw, 0)
-    cam_res = np.array(Image.fromarray(cam_raw).resize((SONO_IMG_SIZE, SONO_IMG_SIZE), Image.BICUBIC))
+        score = predictions[:, pred_class]
+        
+    grads = tape.gradient(score, conv_outputs)
+    
+    if grads is None or tf.reduce_max(tf.abs(grads)).numpy() == 0.0:
+        # Fallback: raw activation map means
+        cam_raw = np.mean(conv_outputs[0].numpy(), axis=-1)
+    else:
+        # Standard Grad-CAM: pool gradients per channel, weight activations
+        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2)).numpy()
+        activations  = conv_outputs[0].numpy().copy()
+        
+        for i in range(pooled_grads.shape[0]):
+            activations[:, :, i] *= pooled_grads[i]
+        
+        cam_raw = np.mean(activations, axis=-1)
+        cam_raw = np.maximum(cam_raw, 0)
+    
+    cam_res = np.array(Image.fromarray(cam_raw.astype(np.float32)).resize(
+        (SONO_IMG_SIZE, SONO_IMG_SIZE), Image.BICUBIC))
     if cam_res.max() > 0:
         cam_res = cam_res / cam_res.max()
 
-    # Denormalize for visualization (grayscale stacked → replicate to RGB)
-    mean    = np.array(IMAGENET_MEAN) * 255.0
-    std     = np.array(IMAGENET_STD)  * 255.0
-    rgb_img = np.clip((img_array * std + mean) / 255.0, 0, 1).astype(np.float32)
+    rgb_img = np.clip(img_array / 255.0, 0, 1).astype(np.float32)
     cam_image = show_cam_on_image(rgb_img, cam_res, use_rgb=True)
     return cam_image, pred_class, confidence, cam_res, probs
+
+
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -422,10 +535,29 @@ def cam_to_base64(cam_image: np.ndarray) -> str:
 
 @app.post("/predict/mammo")
 async def predict_mammo(file: UploadFile = File(...)):
-    """Single mammogram → prediction + confidence + flag + Grad-CAM++ image (base64 PNG)."""
-    if not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File must be an image (JPG/PNG).")
+    """Single mammogram → prediction + confidence + flag + Grad-CAM++ image (base64 PNG).
+    Accepts JPEG/PNG images or DICOM (.dcm) files."""
     raw = await file.read()
+    dicom_metadata = None
+    content_type = (file.content_type or "").lower()
+    is_std_image = content_type.startswith("image/") and "dicom" not in content_type
+
+    # Try DICOM if: extension/magic matches, OR content-type isn't a standard image
+    # (browsers often send .dcm as application/octet-stream)
+    if _is_dicom(raw, file.filename or "") or not is_std_image:
+        if PYDICOM_AVAILABLE:
+            try:
+                raw, dicom_metadata = _dicom_to_jpeg(raw)
+            except Exception:
+                if not is_std_image:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Unsupported file. Upload a JPG, PNG, or DICOM (.dcm) file."
+                    )
+                # It looked like DICOM by name but failed; fall through to PIL
+        elif not is_std_image:
+            raise HTTPException(status_code=400, detail="File must be an image (JPG/PNG) or DICOM (.dcm).")
+
     try:
         image_np   = preprocess_mammogram_image(raw)
         img_tensor = mammo_transform(image=image_np)["image"].unsqueeze(0)
@@ -443,15 +575,33 @@ async def predict_mammo(file: UploadFile = File(...)):
         "flagged"          : flag,
         "flag_reasons"     : reasons,
         "gradcam_image_b64": cam_to_base64(cam_image),
+        "dicom_metadata"   : dicom_metadata,
     })
 
 
 @app.post("/predict/sono")
 async def predict_sono(file: UploadFile = File(...)):
-    """Single sonogram → prediction + confidence + flag + Grad-CAM++ image (base64 PNG)."""
-    if not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="File must be an image (JPG/PNG).")
+    """Single sonogram → prediction + confidence + flag + Grad-CAM++ image (base64 PNG).
+    Accepts JPEG/PNG images or DICOM (.dcm) files."""
     raw = await file.read()
+    dicom_metadata = None
+    content_type = (file.content_type or "").lower()
+    is_std_image = content_type.startswith("image/") and "dicom" not in content_type
+
+    if _is_dicom(raw, file.filename or "") or not is_std_image:
+        if PYDICOM_AVAILABLE:
+            try:
+                raw, dicom_metadata = _dicom_to_jpeg(raw)
+            except Exception:
+                if not is_std_image:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Unsupported file. Upload a JPG, PNG, or DICOM (.dcm) file."
+                    )
+        elif not is_std_image:
+            raise HTTPException(status_code=400, detail="File must be an image (JPG/PNG) or DICOM (.dcm).")
+
+
     try:
         img_array = preprocess_sono_image(raw)
         cam_image, pred_cls, conf, _, probs = sono_gradcam_pp(img_array)
@@ -468,6 +618,7 @@ async def predict_sono(file: UploadFile = File(...)):
         "flagged"          : flag,
         "flag_reasons"     : reasons,
         "gradcam_image_b64": cam_to_base64(cam_image),
+        "dicom_metadata"   : dicom_metadata,
     })
 
 

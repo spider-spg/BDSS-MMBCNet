@@ -64,3 +64,51 @@
     @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1d4ed8]/25 focus-visible:ring-offset-2 focus-visible:ring-offset-white;
   }
 }
+
+/* ── Print / Export PDF styles ───────────────────────────────────────────── */
+@media print {
+  /* Hide interactive chrome */
+  header,
+  aside,
+  .print\:hidden {
+    display: none !important;
+  }
+
+  body {
+    background: #fff;
+    color: #000;
+    font-size: 11pt;
+  }
+
+  /* Make the main content fill the full page */
+  main {
+    padding: 0 !important;
+    overflow: visible !important;
+  }
+
+  /* Ensure images print */
+  img {
+    max-width: 100% !important;
+    break-inside: avoid;
+  }
+
+  /* Show all sections in full on print */
+  .overflow-hidden {
+    overflow: visible !important;
+  }
+
+  /* Page break hints */
+  section {
+    break-inside: avoid;
+  }
+
+  /* Print header — report title */
+  #print-header {
+    display: block !important;
+  }
+}
+
+/* Hidden in screen, visible in print */
+#print-header {
+  display: none;
+}
