@@ -164,7 +164,14 @@ mammo_target_layers = None
 mammo_transform     = None
 sono_model          = None
 sono_last_conv_layer= None
+sono_gradcam_model  = None   # sub-model: (inputs) → [target_layer_output, predictions]
 SONO_IMG_SIZE       = 300
+
+# ── Sono Grad-CAM++ heatmap quality knobs (match notebook defaults) ────────────
+SONO_HEATMAP_THRESHOLD_PERCENTILE = 45   # suppress activations below this percentile
+SONO_HEATMAP_GAMMA                = 1.5  # >1 sharpens the peak, fades the tail faster
+SONO_HEATMAP_BLUR_KERNEL          = 15   # Gaussian blur kernel size (odd int, 0 = off)
+SONO_OVERLAY_MAX_ALPHA            = 0.65 # blend strength at peak activation
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -250,30 +257,18 @@ async def lifespan(app: FastAPI):
     if sono_model.input_shape[1] is not None:
         SONO_IMG_SIZE = sono_model.input_shape[1]
 
-    sono_last_conv_layer = None
-    
-    # Try to find the primary fusion layer first for stable gradients
-    for layer in sono_model.layers:
-        if layer.name == 'feature_fusion':
-            sono_last_conv_layer = layer.name
-            break
-            
-    # Fallback to the last spatial layer
-    if not sono_last_conv_layer:
-        for layer in reversed(sono_model.layers):
-            try:
-                out_shape = layer.output.shape
-                if isinstance(out_shape, list):
-                    out_shape = out_shape[0].shape
-                
-                if len(out_shape) == 4 and out_shape[1] is not None and out_shape[1] > 1:
-                    sono_last_conv_layer = layer.name
-                    break
-            except Exception:
-                continue
-                
+    # ── Auto-detect the best Grad-CAM++ target layer (notebook heuristic) ─────
+    sono_last_conv_layer = _sono_find_gradcam_target_layer(sono_model)
     assert sono_last_conv_layer, "No spatial feature layer found in sono model."
-    print(f"[startup] Sono model loaded  | input={SONO_IMG_SIZE}px | gradcam={sono_last_conv_layer}")
+
+    # Build the sub-model used by sono_gradcam_pp: outputs are
+    # (target_conv_layer_output, final_predictions) – identical to the notebook.
+    global sono_gradcam_model
+    sono_gradcam_model = tf.keras.models.Model(
+        inputs=sono_model.inputs,
+        outputs=[sono_model.get_layer(sono_last_conv_layer).output, sono_model.output],
+    )
+    print(f"[startup] Sono model loaded  | input={SONO_IMG_SIZE}px | gradcam++={sono_last_conv_layer}")
 
     yield
 
@@ -430,55 +425,223 @@ def mammo_gradcam_pp(image_tensor):
     return cam_image, pred_class, confidence, grayscale_cam, probs.cpu().numpy()[0]
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# SONO GRAD-CAM++ HELPERS  (ported from GradCAMPP_MMBCNet_Sonography notebook)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _sono_layer_output_shape(layer):
+    """Return the output shape tuple of a Keras layer, or None on failure."""
+    try:
+        shape = layer.output_shape
+    except Exception:
+        try:
+            shape = layer.output.shape
+        except Exception:
+            return None
+    if isinstance(shape, list):
+        shape = shape[0]
+    return tuple(shape)
+
+
+def _sono_find_gradcam_target_layer(model):
+    """
+    Auto-detect the best Grad-CAM++ target layer using the same heuristic as
+    the notebook: the last 4-D feature-map layer that sits before the final
+    GAP/GMP pooling stage (the one feeding the classifier head).
+    """
+    try:
+        from tensorflow.keras import layers as tf_layers
+        pooling_types = (
+            tf_layers.GlobalAveragePooling2D,
+            tf_layers.GlobalMaxPooling2D,
+        )
+    except Exception:
+        pooling_types = ()
+
+    pooling_indices = [
+        i for i, l in enumerate(model.layers)
+        if pooling_types and isinstance(l, pooling_types)
+    ]
+
+    four_d_candidates = [
+        (i, l.name, _sono_layer_output_shape(l))
+        for i, l in enumerate(model.layers)
+        if _sono_layer_output_shape(l) is not None
+        and len(_sono_layer_output_shape(l)) == 4
+    ]
+
+    if not four_d_candidates:
+        # Absolute fallback: first spatial layer with output > 1px on each dim
+        for layer in reversed(model.layers):
+            try:
+                s = layer.output.shape
+                if len(s) == 4 and s[1] is not None and s[1] > 1:
+                    return layer.name
+            except Exception:
+                continue
+        return None
+
+    if pooling_indices:
+        # Anchor on the LAST pair of pooling layers (avoids CBAM's internal GAP)
+        cutoff = (
+            min(pooling_indices[-2:])
+            if len(pooling_indices) >= 2
+            else pooling_indices[-1]
+        )
+        before_pool = [c for c in four_d_candidates if c[0] < cutoff]
+        if before_pool:
+            chosen = max(before_pool, key=lambda c: c[0])
+            return chosen[1]
+
+    # Fallback: last 4-D layer in the whole model
+    return four_d_candidates[-1][1]
+
+
+def _sono_overlay_heatmap(
+    original_uint8, heatmap,
+    colormap=cv2.COLORMAP_JET,
+    threshold_percentile=SONO_HEATMAP_THRESHOLD_PERCENTILE,
+    gamma=SONO_HEATMAP_GAMMA,
+    blur_ksize=SONO_HEATMAP_BLUR_KERNEL,
+    max_alpha=SONO_OVERLAY_MAX_ALPHA,
+):
+    """
+    Blend a normalised heatmap (values 0-1) onto an RGB uint8 image.
+    Matches the overlay_heatmap() function from the notebook exactly.
+    """
+    h = np.clip(heatmap, 0.0, 1.0).astype(np.float32)
+
+    # Suppress low-activation background noise
+    if threshold_percentile and threshold_percentile > 0:
+        thresh_val = np.percentile(h, threshold_percentile)
+        h = np.where(h >= thresh_val, h - thresh_val, 0.0)
+        max_val = h.max()
+        if max_val > 1e-8:
+            h = h / max_val
+
+    # Smooth surviving blobs
+    if blur_ksize and blur_ksize > 1:
+        k = blur_ksize if blur_ksize % 2 == 1 else blur_ksize + 1
+        h = cv2.GaussianBlur(h, (k, k), 0)
+        h = np.clip(h, 0.0, 1.0)
+
+    # Sharpen contrast
+    if gamma and gamma != 1.0:
+        h = np.power(h, gamma)
+
+    heatmap_uint8 = np.uint8(255 * h)
+    colored = cv2.applyColorMap(heatmap_uint8, colormap)
+    colored = cv2.cvtColor(colored, cv2.COLOR_BGR2RGB)
+
+    # Per-pixel alpha: activated regions are strongly coloured, background stays
+    alpha_map = (h * max_alpha)[..., None]
+    overlay = (
+        original_uint8.astype(np.float32) * (1 - alpha_map)
+        + colored.astype(np.float32) * alpha_map
+    )
+    return np.clip(overlay, 0, 255).astype(np.uint8)
+
+
 def sono_gradcam_pp(img_array):
+    """
+    Proper Grad-CAM++ for the Keras sonography model.
+    Ported from GradCAMPP_MMBCNet_Sonography_(1).ipynb (cell 10).
+
+    Steps
+    -----
+    1. Run TTA prediction for the class probabilities.
+    2. Watch conv_output inside the GradientTape so second-order gradients
+       are available for the alpha computation.
+    3. Compute Grad-CAM++ weights:  alpha = grads² / (2·grads² + A·grads³)
+    4. Produce heatmap = ReLU(Σ_k  weight_k · A_k), normalise to [0, 1].
+    5. Resize to SONO_IMG_SIZE × SONO_IMG_SIZE with bilinear interpolation.
+    6. Overlay with percentile-threshold / Gaussian-blur / gamma / alpha-blend.
+    """
+    eps = 1e-8
     img_batch = tf.cast(np.expand_dims(img_array, 0), tf.float32)
-    
+
+    # ── 1. TTA prediction for class probs ─────────────────────────────────────
     tta_preds = tta_predict(sono_model, img_batch)
     if tta_preds.shape[-1] == 1:
         probs = np.array([1 - float(tta_preds[0]), float(tta_preds[0])])
     else:
         probs = tta_preds[0]
-        
-    pred_class  = int(np.argmax(probs))
-    confidence  = float(probs[pred_class])
 
-    grad_model = tf.keras.models.Model(
-        inputs  = sono_model.inputs,
-        outputs = [sono_model.get_layer('multiply_1').output, sono_model.output],
-    )
-    
-    # Watch the input tensor; the tape records ALL ops from img_batch → conv_outputs → preds
-    # This lets us call tape.gradient(score, conv_outputs) even though conv_outputs wasn't
-    # explicitly watched — the tape traces back through the recorded graph.
+    pred_class = int(np.argmax(probs))
+    confidence = float(probs[pred_class])
+
+    # ── 2. Grad-CAM++ forward + gradient pass ─────────────────────────────────
+    x = tf.convert_to_tensor(img_batch, dtype=tf.float32)
+
     with tf.GradientTape() as tape:
-        tape.watch(img_batch)
-        conv_outputs, predictions = grad_model(img_batch)
-        score = predictions[:, pred_class]
-        
-    grads = tape.gradient(score, conv_outputs)
-    
-    if grads is None or tf.reduce_max(tf.abs(grads)).numpy() == 0.0:
-        # Fallback: raw activation map means
-        cam_raw = np.mean(conv_outputs[0].numpy(), axis=-1)
-    else:
-        # Standard Grad-CAM: pool gradients per channel, weight activations
-        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2)).numpy()
-        activations  = conv_outputs[0].numpy().copy()
-        
-        for i in range(pooled_grads.shape[0]):
-            activations[:, :, i] *= pooled_grads[i]
-        
-        cam_raw = np.mean(activations, axis=-1)
-        cam_raw = np.maximum(cam_raw, 0)
-    
-    cam_res = np.array(Image.fromarray(cam_raw.astype(np.float32)).resize(
-        (SONO_IMG_SIZE, SONO_IMG_SIZE), Image.BICUBIC))
-    if cam_res.max() > 0:
-        cam_res = cam_res / cam_res.max()
+        # Watching conv_output (not the raw input) gives us exact Grad-CAM++
+        # second-order alpha weights without needing higher-order tape nesting.
+        conv_output, predictions = sono_gradcam_model(x, training=False)
+        tape.watch(conv_output)
+        class_score = predictions[:, pred_class]
 
-    rgb_img = np.clip(img_array / 255.0, 0, 1).astype(np.float32)
-    cam_image = show_cam_on_image(rgb_img, cam_res, use_rgb=True)
-    return cam_image, pred_class, confidence, cam_res, probs
+    grads = tape.gradient(class_score, conv_output)  # (1, h, w, k)
+
+    if grads is None:
+        # Tape returned None → fall back to mean activation map
+        heatmap_raw = np.mean(conv_output[0].numpy(), axis=-1)
+        heatmap_raw = np.maximum(heatmap_raw, 0)
+    else:
+        # ── 3. Compute Grad-CAM++ alpha weights ───────────────────────────────
+        conv_out = conv_output[0]   # (h, w, k)
+        g        = grads[0]         # (h, w, k)
+
+        g_sq    = tf.square(g)
+        g_cube  = g_sq * g
+
+        # Σ_spatial A_k  for each channel k
+        A_sum   = tf.reduce_sum(conv_out, axis=(0, 1), keepdims=True)  # (1, 1, k)
+
+        alpha_denom = 2.0 * g_sq + A_sum * g_cube
+        alpha_denom = tf.where(
+            tf.abs(alpha_denom) > eps,
+            alpha_denom,
+            tf.ones_like(alpha_denom) * eps,
+        )
+        alphas = g_sq / alpha_denom  # (h, w, k)
+
+        # Normalise so alphas sum to 1 over spatial positions per channel
+        alphas_sum = tf.reduce_sum(alphas, axis=(0, 1), keepdims=True)
+        alphas_sum = tf.where(
+            tf.abs(alphas_sum) > eps,
+            alphas_sum,
+            tf.ones_like(alphas_sum) * eps,
+        )
+        alphas = alphas / alphas_sum
+
+        # Channel weights:  w_k = Σ_spatial  alpha_k · ReLU(grad_k)
+        weights = tf.reduce_sum(
+            alphas * tf.nn.relu(g), axis=(0, 1)
+        )  # (k,)
+
+        # ── 4. Heatmap = ReLU(Σ_k w_k · A_k) ────────────────────────────────
+        heatmap_raw = tf.reduce_sum(weights * conv_out, axis=-1)  # (h, w)
+        heatmap_raw = tf.nn.relu(heatmap_raw).numpy()
+
+    # ── 5. Normalise and resize to model input resolution ─────────────────────
+    max_val = float(np.max(heatmap_raw))
+    if max_val > eps:
+        heatmap_raw = heatmap_raw / max_val
+    else:
+        heatmap_raw = np.zeros_like(heatmap_raw)
+
+    heatmap = cv2.resize(
+        heatmap_raw.astype(np.float32),
+        (SONO_IMG_SIZE, SONO_IMG_SIZE),
+        interpolation=cv2.INTER_LINEAR,
+    )
+    heatmap = np.clip(heatmap, 0.0, 1.0)
+
+    # ── 6. Produce overlay with notebook-quality postprocessing ───────────────
+    original_uint8 = np.clip(img_array, 0, 255).astype(np.uint8)
+    cam_image = _sono_overlay_heatmap(original_uint8, heatmap)
+
+    return cam_image, pred_class, confidence, heatmap, probs
 
 
 
